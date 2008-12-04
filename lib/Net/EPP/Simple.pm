@@ -11,10 +11,10 @@ use Time::HiRes qw(time);
 use UNIVERSAL qw(isa);
 use base qw(Net::EPP::Client);
 use constant EPP_XMLNS	=> 'urn:ietf:params:xml:ns:epp-1.0';
-use vars qw($VERSION $Error $Code $Message);
+use vars qw($Error $Code $Message);
+use warnings;
 use strict;
 
-our $VERSION	= '0.05';
 our $Error	= '';
 our $Code	= 1000;
 our $Message	= '';
@@ -94,18 +94,31 @@ C<$Net::EPP::Simple::Error> and C<$Net::EPP::Simple::Code>.
 sub new {
 	my ($package, %params) = @_;
 	$params{dom}		= 1;
-	$params{port}		= (int($params{port}) > 0 ? $params{port} : 700);
+	$params{port}		= (defined($params{port}) && int($params{port}) > 0 ? $params{port} : 700);
 	$params{ssl}		= ($params{no_ssl} ? undef : 1);
 
 	my $self = $package->SUPER::new(%params);
 
 	$self->{debug} 		= int($params{debug});
-	$self->{timeout}	= (int($params{timeout}) > 0 ? $params{timeout} : 5);
+	$self->{timeout}	= (defined($params{timeout}) && int($params{timeout}) > 0 ? $params{timeout} : 5);
+	$self->{connected}	= undef;
+	$self->{authenticated}	= undef;
 
 	bless($self, $package);
 
 	$self->debug(sprintf('Attempting to connect to %s:%d', $self->{host}, $self->{port}));
-	$self->{greeting} = $self->connect;
+	eval {
+		$self->{greeting} = $self->connect;
+	};
+	if ($@ ne '' || ref($self->{greeting}) ne 'Net::EPP::Frame::Response') {
+		chomp($@);
+		$@ =~ s/ at .+ line .+$//;
+		$Code = 2400;
+		$Message = $@;
+		return undef;
+	}
+
+	$self->{connected} = 1;
 
 	map { $self->debug('S: '.$_) } split(/\n/, $self->{greeting}->toString(1));
 
@@ -122,7 +135,7 @@ sub new {
 		$el->appendText($object->firstChild->data);
 		$login->svcs->appendChild($el);
 	}
-	my $objects = $self->{greeting}->getElementsByTagNameNS(EPP_XMLNS, 'extURI');
+	$objects = $self->{greeting}->getElementsByTagNameNS(EPP_XMLNS, 'extURI');
 	while (my $object = $objects->shift) {
 		my $el = $login->createElement('objURI');
 		$el->appendText($object->firstChild->data);
@@ -132,7 +145,7 @@ sub new {
 	$self->debug(sprintf('Attempting to login as client ID %s', $self->{user}));
 	my $response = $self->request($login);
 
-	my $Code = $self->_get_response_code($response);
+	$Code = $self->_get_response_code($response);
 	$Message = $self->_get_message($response);
 
 	$self->debug(sprintf('%04d: %s', $Code, $Message));
@@ -140,6 +153,10 @@ sub new {
 	if ($Code > 1999) {
 		$Error = "Error logging in (response code $Code)";
 		return undef;
+
+	} else {
+		$self->{authenticated} = 1;
+
 	}
 
 	return $self;
@@ -482,7 +499,6 @@ optional.
 
 sub _host_infData_to_hash {
 	my ($self, $infData) = @_;
-	my $hash = {};
 
 	my $hash = $self->_get_common_properties_from_infData($infData, 'name');
 
@@ -910,6 +926,7 @@ sub _delete {
 	} else {
 		$Error = "Unknown object type '$type'";
 		return undef;
+
 	}
 
 	my $response = $self->request($frame);
@@ -974,7 +991,7 @@ sub get_frame {
 	my $frame;
 	$self->debug(sprintf('transmitting frame, waiting %d seconds before timeout', $self->{timeout}));
 	eval {
-		local $SIG{ARLM} = sub { die "alarm\n" };
+		local $SIG{ALRM} = sub { die "alarm\n" };
 		$self->debug('setting alarm');
 		alarm($self->{timeout});
 		$frame = $self->SUPER::get_frame();
@@ -1021,15 +1038,20 @@ sub error { $Error }
 
 sub logout {
 	my $self = shift;
-	$self->debug('logging out');
-	my $response = $self->request(Net::EPP::Frame::Command::Logout->new);
-	return undef if (!$response);
+	if (defined($self->{authenticated}) && 1 == $self->{authenticated}) {
+		$self->debug('logging out');
+		my $response = $self->request(Net::EPP::Frame::Command::Logout->new);
+		return undef if (!$response);
+	}
+	$self->debug('disconnecting from server');
 	$self->disconnect;
 	return 1;
 }
 
 sub DESTROY {
-	$_[0]->logout;
+	my $self = shift;
+	$self->debug('DESTROY() method called');
+	$self->logout if (defined($self->{connected}) && 1 == $self->{connected});
 }
 
 sub debug {

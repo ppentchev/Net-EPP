@@ -9,11 +9,9 @@ use Net::EPP::Protocol;
 use Carp;
 use IO::Socket;
 use IO::Socket::SSL;
-use vars qw($VERSION $XMLDOM $EPPFRAME);
+use vars qw($XMLDOM $EPPFRAME);
 use UNIVERSAL qw(isa);
 use strict;
-
-our $VERSION = '0.08';
 
 =pod
 
@@ -220,7 +218,11 @@ sub _connect_tcp {
 		%params
 	);
 
-	croak("Connection to $self->{'sock'} failed: \"$@\"") if (!defined($self->{'connection'}) || ($@ && $@ ne ''));
+	if (!defined($self->{'connection'}) || ($@ && $@ ne '')) {
+		chomp($@);
+		$@ =~ s/^$SocketClass:? ?//;
+		croak("Connection to $self->{'host'}:$self->{'port'} failed: $@")
+	};
 
 	return 1;
 }
