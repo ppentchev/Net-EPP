@@ -7,16 +7,17 @@ package Net::EPP::Simple;
 use Carp;
 use Digest::SHA1 qw(sha1_hex);
 use Net::EPP::Frame;
+use Net::EPP::ResponseCodes;
 use Time::HiRes qw(time);
 use UNIVERSAL qw(isa);
 use base qw(Net::EPP::Client);
 use constant EPP_XMLNS	=> 'urn:ietf:params:xml:ns:epp-1.0';
 use vars qw($Error $Code $Message);
-use warnings;
 use strict;
+use warnings;
 
 our $Error	= '';
-our $Code	= 1000;
+our $Code	= OK;
 our $Message	= '';
 
 =pod
@@ -99,12 +100,21 @@ sub new {
 
 	my $self = $package->SUPER::new(%params);
 
+	$self->{user}		= $params{user};
+	$self->{pass}		= $params{pass};
 	$self->{debug} 		= (defined($params{debug}) ? int($params{debug}) : undef);
 	$self->{timeout}	= (defined($params{timeout}) && int($params{timeout}) > 0 ? $params{timeout} : 5);
+	$self->{reconnect}	= (defined($params{reconnect}) ? int($params{reconnect}) : 3);
 	$self->{connected}	= undef;
 	$self->{authenticated}	= undef;
 
 	bless($self, $package);
+
+	return ($self->_connect ? $self : undef);
+}
+
+sub _connect {
+	my $self = shift;
 
 	$self->debug(sprintf('Attempting to connect to %s:%d', $self->{host}, $self->{port}));
 	eval {
@@ -113,8 +123,9 @@ sub new {
 	if ($@ ne '' || ref($self->{greeting}) ne 'Net::EPP::Frame::Response') {
 		chomp($@);
 		$@ =~ s/ at .+ line .+$//;
-		$Code = 2400;
-		$Message = $@;
+		$self->debug($@);
+		$Code = COMMAND_FAILED;
+		$Error = $Message = $@;
 		return undef;
 	}
 
@@ -126,8 +137,10 @@ sub new {
 
 	my $login = Net::EPP::Frame::Command::Login->new;
 
-	$login->clID->appendText($params{user});
-	$login->pw->appendText($params{pass});
+	$login->clID->appendText($self->{user});
+	$login->pw->appendText($self->{pass});
+	$login->version->appendText($self->{greeting}->getElementsByTagNameNS(EPP_XMLNS, 'version')->shift->firstChild->data);
+	$login->lang->appendText($self->{greeting}->getElementsByTagNameNS(EPP_XMLNS, 'lang')->shift->firstChild->data);
 
 	my $objects = $self->{greeting}->getElementsByTagNameNS(EPP_XMLNS, 'objURI');
 	while (my $object = $objects->shift) {
@@ -142,7 +155,7 @@ sub new {
 		$login->svcs->appendChild($el);
 	}
 
-	$self->debug(sprintf("Attempting to login as client ID '%s'", $params{user}));
+	$self->debug(sprintf("Attempting to login as client ID '%s'", $self->{user}));
 	my $response = $self->request($login);
 
 	$Code = $self->_get_response_code($response);
@@ -159,7 +172,7 @@ sub new {
 
 	}
 
-	return $self;
+	return 1;
 }
 
 =pod
@@ -222,27 +235,32 @@ sub _check {
 		return undef;
 	}
 
-	my $response = $self->request($frame);
+	my $response = $self->_request($frame);
 
-	$Code = $self->_get_response_code($response);
-	$Message = $self->_get_message($response);
-
-	if ($Code > 1999) {
-		$Error = sprintf("Server returned a %d code", $Code);
+	if (!$response) {
 		return undef;
 
 	} else {
-		my $xmlns = (Net::EPP::Frame::ObjectSpec->spec($type))[1];
-		my $key;
-		if ($type eq 'domain' || $type eq 'host') {
-			$key = 'name';
+		$Code = $self->_get_response_code($response);
+		$Message = $self->_get_message($response);
 
-		} elsif ($type eq 'contact') {
-			$key = 'id';
+		if ($Code > 1999) {
+			$Error = sprintf("Server returned a %d code", $Code);
+			return undef;
+
+		} else {
+			my $xmlns = (Net::EPP::Frame::ObjectSpec->spec($type))[1];
+			my $key;
+			if ($type eq 'domain' || $type eq 'host') {
+				$key = 'name';
+
+			} elsif ($type eq 'contact') {
+				$key = 'id';
+
+			}
+			return $response->getNode($xmlns, $key)->getAttribute('avail');
 
 		}
-		return $response->getNode($xmlns, $key)->getAttribute('avail');
-
 	}
 }
 
@@ -252,11 +270,11 @@ sub _check {
 
 You can retrieve information about an object by using one of the following:
 
-	my $info = $epp->domain_info($domain);
+	my $info = $epp->domain_info($domain, $authInfo, $follow);
 
 	my $info = $epp->host_info($host);
 
-	my $info = $epp->contact_info($contact);
+	my $info = $epp->contact_info($contact, $authInfo);
 
 C<Net::EPP::Simple> will construct an C<E<lt>infoE<gt>> frame and send
 it to the server, then parse the response into a simple hash ref. The
@@ -264,11 +282,49 @@ layout of the hash ref depends on the object in question. If there is an
 error, these methods will return C<undef>, and you can then check
 C<$Net::EPP::Simple::Error> and C<$Net::EPP::Simple::Code>.
 
+If C<$authInfo> is defined, it will be sent to the server as per RFC
+4931, Section 3.1.2 and RRC 4933, Section 3.1.2. If the supplied
+authInfo code is validated by the registry, additional information will
+appear in the response. If it is invalid, you should get an error.
+
+If the C<$follow> parameter is true, then C<Net::EPP::Simple> will also
+retrieve the relevant host and contact details for a domain: instead of
+returning an object name or ID for the domain's registrant, contact
+associations, DNS servers or subordinate hosts, the values will be
+replaced with the return value from the appropriate C<host_info()> or
+C<contact_info()> command (unless there was an error, in which case the
+original object ID will be used instead).
+
 =cut
 
 sub domain_info {
-	my ($self, $domain) = @_;
-	return $self->_info('domain', $domain);
+	my ($self, $domain, $authInfo, $follow) = @_;
+	my $result = $self->_info('domain', $domain, $authInfo);
+	return $result if (ref($result) ne 'HASH' || !$follow);
+
+	if (defined($result->{'ns'}) && ref($result->{'ns'}) eq 'ARRAY') {
+		for (my $i = 0 ; $i < scalar(@{$result->{'ns'}}) ; $i++) {
+			my $info = $self->host_info($result->{'ns'}->[$i]);
+			$result->{'ns'}->[$i] = $info if (ref($info) eq 'HASH');
+		}
+	}
+
+	if (defined($result->{'hosts'}) && ref($result->{'hosts'}) eq 'ARRAY') {
+		for (my $i = 0 ; $i < scalar(@{$result->{'hosts'}}) ; $i++) {
+			my $info = $self->host_info($result->{'hosts'}->[$i]);
+			$result->{'hosts'}->[$i] = $info if (ref($info) eq 'HASH');
+		}
+	}
+
+	my $info = $self->contact_info($result->{'registrant'});
+	$result->{'registrant'} = $info if (ref($info) eq 'HASH');
+
+	foreach my $type (keys(%{$result->{'contacts'}})) {
+		my $info = $self->contact_info($result->{'contacts'}->{$type});
+		$result->{'contacts'}->{$type} = $info if (ref($info) eq 'HASH');
+	}
+
+	return $result;
 }
 
 sub host_info {
@@ -277,12 +333,12 @@ sub host_info {
 }
 
 sub contact_info {
-	my ($self, $contact) = @_;
-	return $self->_info('contact', $contact);
+	my ($self, $contact, $authInfo) = @_;
+	return $self->_info('contact', $contact, $authInfo);
 }
 
 sub _info {
-	my ($self, $type, $identifier) = @_;
+	my ($self, $type, $identifier, $authInfo) = @_;
 	my $frame;
 	if ($type eq 'domain') {
 		$frame = Net::EPP::Frame::Command::Info::Domain->new;
@@ -299,29 +355,44 @@ sub _info {
 	} else {
 		$Error = "Unknown object type '$type'";
 		return undef;
+
 	}
 
-	my $response = $self->request($frame);
+	if (defined($authInfo) && $authInfo ne '') {
+		$self->debug('adding authInfo element to request frame');
+		my $el = $frame->createElement((Net::EPP::Frame::ObjectSpec->spec($type))[0].':authInfo');
+		my $pw = $frame->createElement((Net::EPP::Frame::ObjectSpec->spec($type))[0].':pw');
+		$pw->appendChild($frame->createTextNode($authInfo));
+		$el->appendChild($pw);
+		$frame->getNode((Net::EPP::Frame::ObjectSpec->spec($type))[1], 'info')->appendChild($el);
+	}
 
-	$Code = $self->_get_response_code($response);
-	$Message = $self->_get_message($response);
+	my $response = $self->_request($frame);
 
-	if ($Code > 1999) {
-		$Error = sprintf("Server returned a %d code", $Code);
+	if (!$response) {
 		return undef;
 
 	} else {
-		my $infData = $response->getNode((Net::EPP::Frame::ObjectSpec->spec($type))[1], 'infData');
+		$Code = $self->_get_response_code($response);
+		$Message = $self->_get_message($response);
 
-		if ($type eq 'domain') {
-			return $self->_domain_infData_to_hash($infData);
+		if ($Code > 1999) {
+			$Error = sprintf("Server returned a %d code", $Code);
+			return undef;
 
-		} elsif ($type eq 'contact') {
-			return $self->_contact_infData_to_hash($infData);
+		} else {
+			my $infData = $response->getNode((Net::EPP::Frame::ObjectSpec->spec($type))[1], 'infData');
 
-		} elsif ($type eq 'host') {
-			return $self->_host_infData_to_hash($infData);
+			if ($type eq 'domain') {
+				return $self->_domain_infData_to_hash($infData);
 
+			} elsif ($type eq 'contact') {
+				return $self->_contact_infData_to_hash($infData);
+
+			} elsif ($type eq 'host') {
+				return $self->_host_infData_to_hash($infData);
+
+			}
 		}
 	}
 }
@@ -568,10 +639,12 @@ sub _contact_infData_to_hash {
 
 	foreach my $name ('voice', 'fax') {
 		my $els = $infData->getElementsByLocalName($name);
-		if ($els->size == 1) {
+		if (defined($els) && $els->size == 1) {
 			my $el = $els->shift;
-			$hash->{$name} = $el->textContent;
-			$hash->{$name} .= 'x'.$el->getAttribute('x') if ($el->getAttribute('x') ne '');
+			if (defined($el)) {
+				$hash->{$name} = $el->textContent;
+				$hash->{$name} .= 'x'.$el->getAttribute('x') if (defined($el->getAttribute('x')) && $el->getAttribute('x') ne '');
+			}
 		}
 	}
 
@@ -660,7 +733,7 @@ sub _transfer_request {
 	eval("\$frame = $class->new");
 	if ($@ || ref($frame) ne $class) {
 		$Error = "Error building request frame: $@";
-		$Code = 2400;
+		$Code = COMMAND_FAILED;
 		return undef;
 
 	} else {
@@ -680,27 +753,33 @@ sub _transfer_request {
 		$frame->setPeriod(int($period)) if ($op eq 'request');
 	}
 
-	my $response = $self->request($frame);
+	my $response = $self->_request($frame);
 
-	$Code = $self->_get_response_code($response);
-	$Message = $self->_get_message($response);
 
-	if ($Code > 1999) {
-		$Error = $response->msg;
+	if (!$response) {
 		return undef;
 
-	} elsif ($op eq 'query' || $op eq 'request') {
-		my $trnData = $response->getElementsByLocalName('trnData')->shift;
-		my $hash = {};
-		foreach my $child ($trnData->childNodes) {
-			$hash->{$child->localName} = $child->textContent;
-		}
-
-		return $hash;
-
 	} else {
-		return 1;
+		$Code = $self->_get_response_code($response);
+		$Message = $self->_get_message($response);
 
+		if ($Code > 1999) {
+			$Error = $response->msg;
+			return undef;
+
+		} elsif ($op eq 'query' || $op eq 'request') {
+			my $trnData = $response->getElementsByLocalName('trnData')->shift;
+			my $hash = {};
+			foreach my $child ($trnData->childNodes) {
+				$hash->{$child->localName} = $child->textContent;
+			}
+
+			return $hash;
+
+		} else {
+			return 1;
+
+		}
 	}
 }
 
@@ -796,14 +875,44 @@ When creating a new domain object, you may also specify a C<period> key, like so
 
 	$epp->create_domain($domain);
 
-C<Net::EPP::Simple> assumes the registry uses the host object model rather
-than the host attribute model.
+The C<period> key is assumed to be in years rather than months. C<Net::EPP::Simple>
+assumes the registry uses the host object model rather than the host attribute model.
 
 =cut
 
 sub create_domain {
 	my ($self, $domain) = @_;
-	croak("Unfinished method create_domain()");
+
+	print Data::Dumper::Dumper($domain);
+
+	my $frame = Net::EPP::Frame::Command::Create::Domain->new;
+	$frame->setDomain($domain->{'name'});
+	$frame->setPeriod($domain->{'period'});
+	$frame->setRegistrant($domain->{'registrant'});
+	$frame->setContacts($domain->{'contacts'});
+	$frame->setNS(@{$domain->{'ns'}});
+
+	$frame->setAuthInfo($domain->{authInfo}) if ($domain->{authInfo} ne '');
+
+	my $response = $self->_request($frame);
+
+
+	if (!$response) {
+		return undef;
+
+	} else {
+		$Code = $self->_get_response_code($response);
+		$Message = $self->_get_message($response);
+
+		if ($Code > 1999) {
+			$Error = $response->msg;
+			return undef;
+
+		} else {
+			return 1;
+
+		}
+	}
 }
 
 sub create_host {
@@ -838,20 +947,24 @@ sub create_contact {
 		}
 	}
 
-	my $response = $self->request($frame);
+	my $response = $self->_request($frame);
 
-	$Code = $self->_get_response_code($response);
-	$Message = $self->_get_message($response);
-
-	if ($Code > 1999) {
-		$Error = $response->msg;
+	if (!$response) {
 		return undef;
 
 	} else {
-		return 1;
+		$Code = $self->_get_response_code($response);
+		$Message = $self->_get_message($response);
 
+		if ($Code > 1999) {
+			$Error = $response->msg;
+			return undef;
+
+		} else {
+			return 1;
+
+		}
 	}
-
 }
 
 sub update_domain {
@@ -929,18 +1042,24 @@ sub _delete {
 
 	}
 
-	my $response = $self->request($frame);
+	my $response = $self->_request($frame);
 
-	$Code = $self->_get_response_code($response);
-	$Message = $self->_get_message($response);
 
-	if ($Code > 1999) {
-		$Error = sprintf("Server returned a %d code", $Code);
+	if (!$response) {
 		return undef;
 
 	} else {
-		return 1;
+		$Code = $self->_get_response_code($response);
+		$Message = $self->_get_message($response);
 
+		if ($Code > 1999) {
+			$Error = sprintf("Server returned a %d code", $Code);
+			return undef;
+
+		} else {
+			return 1;
+
+		}
 	}
 }
 
@@ -966,6 +1085,46 @@ Returns the a C<Net::EPP::Frame::Greeting> object representing the greeting retu
 
 sub greeting { $_[0]->{greeting} }
 
+sub ping {
+	my $self = shift;
+	my $hello = Net::EPP::Frame::Hello->new;
+	my $response = $self->request($hello);
+
+	return (isa($response, 'XML::LibXML::Document') ? 1 : undef);
+}
+
+sub _request {
+	my ($self, $frame) = @_;
+
+	if ($self->{reconnect} > 0) {
+		if (!$self->ping) {
+			$self->debug('connection seems dead, trying to reconnect');
+			for (1..$self->{reconnect}) {
+				$self->debug("attempt #$_");
+				if ($self->_connect) {
+					$self->debug("attempt #$_ succeeded");
+					return $self->request($frame);
+
+				} else {
+					$self->debug("attempt #$_ failed, sleeping");
+					sleep($self->{timeout});
+
+				}
+			}
+			$self->debug('unable to reconnect!');
+			return undef;
+
+		} else {
+			return $self->request($frame);
+
+		}
+
+	} else {
+		return $self->request($frame);
+
+	}
+}
+
 =pod
 
 =head1 Overridden Methods From C<Net::EPP::Client>
@@ -983,6 +1142,13 @@ frame back up to C<Net::EPP::Client>.
 
 sub request {
 	my ($self, $frame) = @_;
+	# Make sure we start with blank variables
+	$Code		= undef;
+	$Error		= '';
+	$Message	= '';
+
+	$frame->clTRID->appendText(sha1_hex(ref($self).time().$$)) if (isa($frame, 'Net::EPP::Frame::Command'));
+
 	$self->debug(sprintf('sending a %s to the server', ref($frame)));
 	if (isa($frame, 'XML::LibXML::Document')) {
 		map { $self->debug('C: '.$_) } split(/\n/, $frame->toString(1));
@@ -991,11 +1157,11 @@ sub request {
 		map { $self->debug('C: '.$_) } split(/\n/, $frame);
 
 	}
-	$frame->clTRID->appendText(sha1_hex(ref($self).time().$$)) if (isa($frame, 'XML::LibXML::Node'));
+
 	my $response = $self->SUPER::request($frame);
-	if (isa($response, 'XML::LibXML::Document')) {
-		map { $self->debug('S: '.$_) } split(/\n/, $response->toString(1));
-	}
+
+	map { $self->debug('S: '.$_) } split(/\n/, $response->toString(1)) if (isa($response, 'XML::LibXML::Document'));
+
 	return $response;
 }
 
@@ -1011,19 +1177,20 @@ network errors. If such an error occurs it will return C<undef>.
 sub get_frame {
 	my $self = shift;
 	my $frame;
-	$self->debug(sprintf('transmitting frame, waiting %d seconds before timeout', $self->{timeout}));
+	$self->debug(sprintf('reading frame, waiting %d seconds before timeout', $self->{timeout}));
 	eval {
 		local $SIG{ALRM} = sub { die "alarm\n" };
-		$self->debug('setting alarm');
+		$self->debug('setting timeout alarm for receiving frame');
 		alarm($self->{timeout});
 		$frame = $self->SUPER::get_frame();
-		$self->debug('unsetting alarm');
+		$self->debug('unsetting timeout alarm after successful receive');
 		alarm(0);
 	};
 	if ($@ ne '') {
-		$self->debug('unsetting alarm');
+		$self->debug('unsetting timeout alarm after alarm was triggered');
 		alarm(0);
-		$Error = "get_frame() timed out\n";
+		$Code = COMMAND_FAILED;
+		$Error = $Message = "get_frame() timed out\n";
 		return undef;
 
 	} else {
@@ -1065,6 +1232,7 @@ sub logout {
 	}
 	$self->debug('disconnecting from server');
 	$self->disconnect;
+	$self->{connected} = 0;
 	return 1;
 }
 
@@ -1081,7 +1249,7 @@ sub debug {
 
 =pod
 
-=head1 PACKAGE VARIABLES
+=head1 Package Variables
 
 =head2 $Net::EPP::Simple::Error
 

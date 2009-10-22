@@ -100,8 +100,9 @@ return a true value.
 
 sub send_frame {
 	my ($class, $fh, $xml) = @_;
-	croak("Connection closed") if (ref($fh) ne 'IO::Socket::SSL' && $fh->eof); # eof() dies for me
+#	croak("Connection closed") if (ref($fh) ne 'IO::Socket::SSL' && $fh->eof); # eof() dies for me
 	$fh->print($class->prep_frame($xml));
+	$fh->flush;
 	return 1;
 }
 
