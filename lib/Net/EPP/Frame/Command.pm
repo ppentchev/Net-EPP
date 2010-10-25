@@ -13,6 +13,7 @@ use Net::EPP::Frame::Command::Logout;
 use Net::EPP::Frame::Command::Poll;
 use Net::EPP::Frame::Command::Renew;
 use Net::EPP::Frame::Command::Transfer;
+use Net::EPP::Frame::Command::Undelete;
 use Net::EPP::Frame::Command::Update;
 use base qw(Net::EPP::Frame);
 use strict;
