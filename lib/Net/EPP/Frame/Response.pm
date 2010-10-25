@@ -1,4 +1,4 @@
-# Copyright (c) 2009 CentralNic Ltd. All rights reserved. This program is
+# Copyright (c) 2010 CentralNic Ltd. All rights reserved. This program is
 # free software; you can redistribute it and/or modify it under the same
 # terms as Perl itself.
 # 
@@ -74,6 +74,11 @@ C<E<lt>resultE<gt>> element.
 This method returns the L<XML::LibXML::Element> object corresponding to the
 C<E<lt>msgE<gt>> element.
 
+	my $node = $frame->resData;
+
+This method returns the L<XML::LibXML::Element> object corresponding to the
+C<E<lt>resDataE<gt>> element.
+
 	my $node = $frame->trID;
 
 This method returns the L<XML::LibXML::Element> object corresponding to the
@@ -93,6 +98,7 @@ C<E<lt>svTRIDE<gt>> element.
 
 sub response {$_[0]->getNode('response') }
 sub result {$_[0]->getNode('result') }
+sub resData {$_[0]->getNode('resData') }
 sub trID {$_[0]->getNode('trID') }
 sub clTRID {$_[0]->getNode('clTRID') }
 sub svTRID {$_[0]->getNode('svTRID') }

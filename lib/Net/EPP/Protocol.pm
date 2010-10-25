@@ -1,4 +1,4 @@
-# Copyright (c) 2009 CentralNic Ltd. All rights reserved. This program is
+# Copyright (c) 2010 CentralNic Ltd. All rights reserved. This program is
 # free software; you can redistribute it and/or modify it under the same
 # terms as Perl itself.
 package Net::EPP::Protocol;
@@ -63,25 +63,31 @@ sub get_frame {
 	my ($class, $fh) = @_;
 
 	my $hdr;
-	$fh->read($hdr, 4);
-	my $length = (unpack('N', $hdr) - 4);
-	if ($length < 1) {
+	if (!defined($fh->read($hdr, 4))) {
 		croak("Got a bad frame length from peer - connection closed?");
 
 	} else {
-		my $xml = '';
-		my $buffer;
-		while (length($xml) < $length) {
-			$buffer = '';
-			$fh->read($buffer, ($length - length($xml)));
-			last if (length($buffer) == 0); # in case the socket has closed
-			$xml .= $buffer;
+		my $length = (unpack('N', $hdr) - 4);
+		if ($length < 0) {
+			croak("Got a bad frame length from peer - connection closed?");
+
+		} elsif (0 == $length) {
+			croak('Frame length is zero');
+
+		} else {
+			my $xml = '';
+			my $buffer;
+			while (length($xml) < $length) {
+				$buffer = '';
+				$fh->read($buffer, ($length - length($xml)));
+				last if (length($buffer) == 0); # in case the socket has closed
+				$xml .= $buffer;
+			}
+
+			return $xml;
+
 		}
-
-		return $xml;
-
 	}
-
 }
 
 =pod
@@ -100,7 +106,6 @@ return a true value.
 
 sub send_frame {
 	my ($class, $fh, $xml) = @_;
-#	croak("Connection closed") if (ref($fh) ne 'IO::Socket::SSL' && $fh->eof); # eof() dies for me
 	$fh->print($class->prep_frame($xml));
 	$fh->flush;
 	return 1;
